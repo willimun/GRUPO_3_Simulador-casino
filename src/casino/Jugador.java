@@ -4,37 +4,45 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Jugador del casino. Cada jugador es un <b>hilo independiente</b>
- * ({@link Runnable}) que repite el ciclo: elegir apuesta, entregarla a la
- * {@link Banca}, esperar el resultado de la ruleta y cobrar o perder.
+ * ({@link Runnable}) que se sincroniza con la {@link Banca} mediante las
+ * barreras de su {@link java.util.concurrent.Phaser}.
+ *
+ * <h2>Protocolo de una ronda (4 barreras)</h2>
+ * <ol>
+ *   <li><b>F0 - apertura:</b> espera a que la banca abra la ronda. Justo
+ *       después lee {@link Banca#mesaAbierta()}; si es {@code false}, se marcha.</li>
+ *   <li><b>Apuesta:</b> retira el importe de su saldo y lo ingresa en la banca
+ *       ({@link Banca#recibirApuesta(int)}).</li>
+ *   <li><b>F1 - apuestas cerradas:</b> espera a que todos hayan apostado; la
+ *       banca gira la ruleta.</li>
+ *   <li><b>F2 - resultado visible:</b> lee {@link Banca#getResultado()}, y si
+ *       acierta cobra el premio con {@link Banca#pagar(int)}.</li>
+ *   <li><b>F3 - liquidación terminada:</b> espera a que todos hayan cobrado.
+ *       Si se ha quedado sin dinero, se da de baja con
+ *       {@link Banca#abandonar()}.</li>
+ * </ol>
  *
  * <h2>Programación multihilo</h2>
  * <ul>
- *   <li><b>Recurso compartido:</b> el {@code saldo}. Lo modifica el propio
- *       jugador y puede leerlo o modificarlo la banca desde otro hilo, por lo
- *       que es una sección crítica.</li>
- *   <li><b>Exclusión mutua:</b> todos los accesos al saldo son métodos
- *       {@code synchronized} sobre el propio jugador. Así la operación
- *       "comprobar saldo y restar" de {@link #retirar(int)} es atómica y no
- *       hay race conditions (por ejemplo, dos hilos gastando el mismo dinero).</li>
- *   <li><b>Sin espera activa:</b> mientras la ronda no se resuelve, el jugador
- *       queda bloqueado dentro de {@link Banca#apostar(Apuesta)} (estado
- *       WAITING/BLOCKED del hilo) y no consume CPU.</li>
- *   <li><b>Parada limpia:</b> el hilo termina cuando se queda sin saldo o
- *       cuando se le interrumpe ({@link Thread#interrupt()}), por ejemplo al
- *       cerrar el casino.</li>
+ *   <li><b>Sin espera activa:</b> {@link Banca#esperarFase()} bloquea el hilo
+ *       de verdad (estado WAITING), no hay bucles comprobando nada.</li>
+ *   <li><b>Exclusión mutua:</b> el saldo del jugador solo lo modifica su propio
+ *       hilo, pero se accede con métodos {@code synchronized} para que
+ *       cualquier otro hilo lo lea con visibilidad garantizada. El saldo de la
+ *       banca está protegido por su propio {@code ReentrantLock} justo.</li>
+ *   <li><b>Sin deadlock:</b> todos los jugadores llaman a las barreras en el
+ *       mismo orden. Un jugador eliminado avisa con
+ *       {@link Banca#jugadorEliminado()} <i>antes</i> de la barrera F3, para
+ *       que la banca ya vea el contador actualizado al decidir si cierra, y se
+ *       da de baja del Phaser <i>después</i>, para no bloquear a los demás.</li>
  * </ul>
- *
- * <p>Contrato esperado de la banca (acordar con quien implemente la tarjeta 3.0):
- * {@code int apostar(Apuesta a) throws InterruptedException}, que bloquea hasta
- * que la ruleta resuelve la ronda y devuelve el importe total a cobrar
- * (0 si pierde; apuesta más ganancia si acierta).</p>
  */
 public class Jugador implements Runnable {
 
     /** Apuesta máxima por ronda. */
     private static final int APUESTA_MAXIMA = 50;
 
-    /** Apuesta mínima por ronda. */
+    /** Apuesta mínima por ronda. Con menos saldo que esto el jugador queda eliminado. */
     private static final int APUESTA_MINIMA = 1;
 
     /** Nombre del jugador, usado en los mensajes de registro. */
@@ -49,9 +57,9 @@ public class Jugador implements Runnable {
     /**
      * Crea un jugador.
      *
-     * @param nombre      nombre del jugador
+     * @param nombre       nombre del jugador
      * @param saldoInicial dinero con el que empieza; debe ser positivo
-     * @param banca       banca a la que entregará sus apuestas
+     * @param banca        banca con la que se sincroniza
      * @throws IllegalArgumentException si el saldo inicial no es positivo
      */
     public Jugador(String nombre, int saldoInicial, Banca banca) {
@@ -64,65 +72,94 @@ public class Jugador implements Runnable {
     }
 
     /**
-     * Ciclo de vida del hilo: juega rondas mientras tenga saldo y no sea
-     * interrumpido. Al terminar, deja constancia por consola.
+     * Ciclo de vida del hilo: juega rondas hasta que la banca cierra la mesa
+     * o el jugador se queda sin dinero.
      */
     @Override
     public void run() {
         System.out.println(nombre + " se sienta a jugar con " + getSaldo() + " €");
         try {
-            while (!Thread.currentThread().isInterrupted()
-                    && getSaldo() >= APUESTA_MINIMA) {
-                jugarRonda();
+            while (true) {
+                banca.esperarFase();                    // F0: apertura de ronda
+                if (!banca.mesaAbierta()) {
+                    break;                              // la banca cierra: nos vamos
+                }
+
+                Apuesta apuesta = generarApuesta();
+                retirar(apuesta.importe());             // el dinero sale de mi saldo...
+                banca.recibirApuesta(apuesta.importe()); // ...y entra en el de la banca
+
+                banca.esperarFase();                    // F1: todas las apuestas hechas
+                banca.esperarFase();                    // F2: la ruleta ya ha girado
+
+                liquidar(apuesta, banca.getResultado());
+
+                boolean eliminado = getSaldo() < APUESTA_MINIMA;
+                if (eliminado) {
+                    banca.jugadorEliminado();           // ANTES de F3, la banca lo verá al decidir
+                }
+                banca.esperarFase();                    // F3: todos han liquidado
+                if (eliminado) {
+                    banca.abandonar();                  // DESPUÉS de F3: no bloquea a nadie
+                    break;
+                }
             }
-        } catch (InterruptedException e) {
-            // Restauramos la marca de interrupción y salimos del bucle.
-            Thread.currentThread().interrupt();
         } finally {
             System.out.println(nombre + " abandona el casino con " + getSaldo() + " €");
         }
     }
 
     /**
-     * Juega una ronda completa: retira el importe, lo entrega a la banca,
-     * espera el resultado y cobra el premio.
+     * Comprueba si la apuesta gana y, en ese caso, cobra el premio a la banca.
+     * El premio total es la apuesta devuelta más las ganancias
+     * (importe x (multiplicador + 1)). Si la banca no tiene saldo suficiente,
+     * {@link Banca#pagar(int)} entrega lo que le quede.
      *
-     * <p>Si el hilo es interrumpido mientras espera, la ronda no se ha
-     * resuelto, así que se <b>devuelve la apuesta</b> al saldo (caso límite
-     * que evita perder dinero por cerrar el casino).</p>
-     *
-     * @throws InterruptedException si el hilo es interrumpido durante la espera
+     * @param apuesta   apuesta realizada en esta ronda
+     * @param resultado número que ha salido en la ruleta (0-36)
      */
-    private void jugarRonda() throws InterruptedException {
-        Apuesta apuesta = generarApuesta();
-        if (!retirar(apuesta.importe())) {
-            return; // el saldo cambió entre generar la apuesta y retirarla
+    private void liquidar(Apuesta apuesta, int resultado) {
+        int cobrado = 0;
+        if (acierta(apuesta, resultado)) {
+            cobrado = banca.pagar(apuesta.importe() * (apuesta.tipo().getMultiplicador() + 1));
+            ingresar(cobrado);
         }
-        try {
-            int premio = banca.apostar(apuesta); // bloquea sin espera activa
-            ingresar(premio);
-            System.out.println(nombre + " apuesta " + apuesta.importe() + " € a "
-                    + apuesta.tipo() + (premio > 0 ? " y GANA " + premio : " y pierde")
-                    + " (saldo: " + getSaldo() + " €)");
-        } catch (InterruptedException e) {
-            ingresar(apuesta.importe()); // ronda sin resolver: se devuelve la apuesta
-            throw e;
-        }
+        System.out.println(nombre + " apuesta " + apuesta.importe() + " € a " + apuesta.tipo()
+                + (apuesta.tipo() == TipoApuesta.NUMERO ? " (" + apuesta.numero() + ")" : "")
+                + " -> sale " + resultado
+                + (cobrado > 0 ? " y GANA " + cobrado + " €" : " y pierde")
+                + " (saldo: " + getSaldo() + " €)");
+    }
+
+    /**
+     * Indica si una apuesta es ganadora. El 0 pierde para par e impar
+     * ("gana la banca"), pero sí gana si se apostó al número 0.
+     *
+     * @param apuesta   apuesta a comprobar
+     * @param resultado número que ha salido
+     * @return {@code true} si la apuesta acierta
+     */
+    private boolean acierta(Apuesta apuesta, int resultado) {
+        return switch (apuesta.tipo()) {
+            case NUMERO -> resultado == apuesta.numero();
+            case PAR -> resultado != 0 && resultado % 2 == 0;
+            case IMPAR -> resultado % 2 == 1;
+        };
     }
 
     /**
      * Genera una apuesta aleatoria que nunca supera el saldo disponible.
-     * Usa {@link ThreadLocalRandom}, que es seguro y eficiente con varios
-     * hilos porque cada uno tiene su propio generador.
+     * Usa {@link ThreadLocalRandom}, seguro con varios hilos porque cada uno
+     * tiene su propio generador.
      *
      * @return una apuesta válida
      */
     private Apuesta generarApuesta() {
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
         int maximo = Math.min(APUESTA_MAXIMA, getSaldo());
-        int importe = rnd.nextInt(APUESTA_MINIMA, Math.max(APUESTA_MINIMA, maximo) + 1);
+        int importe = rnd.nextInt(APUESTA_MINIMA, maximo + 1);
         TipoApuesta tipo = TipoApuesta.values()[rnd.nextInt(TipoApuesta.values().length)];
-        int numero = rnd.nextInt(0, 37);
+        int numero = rnd.nextInt(Ruleta.CASILLAS);
         return new Apuesta(tipo, numero, importe);
     }
 
@@ -142,8 +179,7 @@ public class Jugador implements Runnable {
     }
 
     /**
-     * Suma dinero al saldo de forma atómica. Puede llamarla la banca desde
-     * otro hilo para pagar un premio.
+     * Suma dinero al saldo de forma atómica.
      *
      * @param cantidad dinero a ingresar; si es 0 o negativo no hace nada
      */
